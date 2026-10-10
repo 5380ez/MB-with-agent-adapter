@@ -1,0 +1,80 @@
+# mini-swe-agent config for MobilityBench.
+#
+# The shipped `mini.yaml` coaches the agent through a *software* workflow
+# (read the repo, reproduce the bug, edit source, run tests). Route planning
+# needs the opposite frame: the agent is a mobility assistant that must query
+# real data through the sandbox tools and then answer the user.
+#
+# Bash is mini's only tool, so the sandbox is exposed as a CLI
+# (`mcp_server/sandbox_cli.py`) — the same 9 deterministic replay tools the MCP
+# harnesses call, returning identical JSON payloads.
+#
+# Launch (see `mini_swe.py`, which assembles this command):
+#   mini -m openai/<model> -c configs/harness/mini_swe.yaml \
+#        -c model.model_kwargs.api_base=<base_url> \
+#        -c model.model_kwargs.api_key=<key> -o <traj.json> -y -t "<task>"
+#
+# Model routing goes through litellm, so the endpoint is set on
+# model.model_kwargs (api_base/api_key) rather than OPENAI_BASE_URL, and the
+# model is addressed as `openai/<id>`. `sandbox_cli` is injected as an env var
+# by the adapter and surfaces in the jinja context via
+# LocalEnvironment.get_template_vars().
+
+agent:
+  system_template: |
+    You are the MobilityBench 出行路线规划助手 (a travel-route planning assistant).
+    You solve the user's request by gathering real data with the sandbox tools,
+    then answering in concise Chinese. Never invent coordinates or routes.
+  instance_template: |
+    {{task}}
+
+    ## Sandbox tools (use these — do not fabricate data)
+
+    The sandbox is exposed as a command `{{sandbox_cli}}`. Run it with the venv
+    python. Each call prints a JSON object `{"status", "data", "error"}`.
+
+    Run `{{sandbox_cli}} list` first to print the authoritative tool surface
+    (names + parameters). Do NOT guess parameter names — read them from `list`.
+
+    The tool parameter names shown above are passed as `--flag value`; never
+    invent a `city` flag for a tool whose signature does not list one.
+
+    A few common calls (see `list` for the full, exact signature):
+
+    - `{{sandbox_cli}} query_poi --keywords <关键词> [--city <城市>]`
+    - `{{sandbox_cli}} reverse_geocoding --longitude <经度> --latitude <纬度>`
+    - `{{sandbox_cli}} driving_route --origin <lng,lat> --destination <lng,lat> [--strategy <n>]`
+    - `{{sandbox_cli}} walking_route --origin <lng,lat> --destination <lng,lat>`
+    - `{{sandbox_cli}} bicycling_route --origin <lng,lat> --destination <lng,lat>`
+    - `{{sandbox_cli}} bus_route --origin <lng,lat> --destination <lng,lat>`
+    - `{{sandbox_cli}} search_around_poi --location <lng,lat> [--keywords <关键词>] [--radius <米>]`
+    - `{{sandbox_cli}} weather_query --city <城市> [--need_forecast <true|false>]`
+    - `{{sandbox_cli}} traffic_status --name <道路名> --city <城市>`
+
+    ## Rules
+
+    1. `bash` is your ONLY tool. The sandbox tool names above are NOT tools —
+       they are command-line arguments to `bash`. Never call `query_poi`,
+       `search_around_poi` or any other sandbox name as a tool; always invoke
+       them through a `bash` command as shown.
+    2. Every response MUST contain at least one `bash` tool call carrying a
+       non-empty `command` argument. A `bash` call without a `command` is
+       rejected.
+    3. Query the sandbox for any coordinate, distance, route or POI you need.
+    4. When you have enough data, finish by writing your final Chinese answer
+       AND running exactly this as your one bash call in that same message:
+       `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`
+    5. After that command you cannot keep working — so make sure your answer is
+       already written in the same message before it.
+
+model:
+  model_kwargs:
+    drop_params: true
+
+environment:
+  timeout: 120
+  # The adapter exports `sandbox_cli` into the child env; LocalEnvironment
+  # merges os.environ into the jinja context, so `{{sandbox_cli}}` above resolves
+  # without any library import. `env` here is passed through to every bash call.
+  env:
+    MOBILITY_BENCH_QUIET: "1"

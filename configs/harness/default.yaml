@@ -1,0 +1,80 @@
+# MobilityBench Harness Configuration
+#
+# Mirrors the paper's `experiment.yaml`: the harness is everything around the
+# agent loop (tools, context/memory, skills, planning, sandbox rules, retries
+# and stopping policies). Each stanza pins how one agent-under-test is launched
+# so runs stay reproducible and adapters stay free of hard-coded launch flags.
+#
+# Fields:
+#   bin            executable name (or absolute path); env overrides exist per
+#                  adapter (CODEX_BIN / CLAUDE_BIN / DSH_BIN / MINI_BIN)
+#   protocol       wire protocol the CLI speaks: openai | anthropic
+#   wire_api       openai-protocol variant: chat | responses
+#   profile        named launch profile (dsh only; `headless` is the one-shot app)
+#   version        pinned CLI version used for the run
+#   context_window model context window in tokens
+#   max_output_tokens  per-response output budget the harness requests (claude
+#                  defaults to 32000, which overflows a 32768-token window)
+#   timeout        wall-clock budget per case, seconds
+#   max_steps      harness step budget (0 = harness default)
+#   effort         reasoning effort hint, when the harness supports one
+#   mcp_client     whether the adapter wires the sandbox MCP server into the run
+harnesses:
+  codex:
+    bin: codex
+    protocol: openai
+    wire_api: responses
+    version: ""
+    context_window: 32768
+    timeout: 900
+    mcp_client: true
+
+  claude_code:
+    bin: claude
+    protocol: anthropic
+    version: ""
+    context_window: 32768
+    max_output_tokens: 4096
+    timeout: 900
+    mcp_client: true
+
+  # dsh's one-shot app is the `headless` profile: `dsh --profile headless --json "<task>"`.
+  # The model route is injected per run via a --patch overlay (llm-pi-ai ->
+  # OpenAI-compatible vLLM), so nothing here hard-codes the endpoint.
+  dsh:
+    bin: dsh
+    protocol: openai
+    wire_api: chat
+    profile: headless
+    version: ""
+    context_window: 32768
+    timeout: 900
+    mcp_client: true
+
+  # dsh-mini: the same CLI and profile as ``dsh``, but with a halved model
+  # context window (the paper's lightweight arm: a smaller per-run token budget).
+  # The sandbox MCP client is mounted too — without it the profile only exposes
+  # its built-in ``web_search`` tool, which needs a DeepSeek key and fails on
+  # every call, so the agent can never reach the sandbox at all.
+  dsh_mini:
+    bin: dsh
+    protocol: openai
+    wire_api: chat
+    profile: headless
+    version: ""
+    context_window: 16384
+    timeout: 900
+    mcp_client: true
+
+  # mini-swe-agent: the model is configured through litellm `model_name` +
+  # `model_kwargs` (base_url/api_key), and the transcript is written to
+  # `--output <path>` as a mini-swe-agent trajectory, not to stdout.
+  mini_swe:
+    bin: mini
+    protocol: openai
+    wire_api: chat
+    version: ""
+    context_window: 32768
+    timeout: 900
+    max_steps: 0
+    mcp_client: false

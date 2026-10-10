@@ -1,0 +1,24 @@
+# MobilityBench Agent
+agent:
+  # Any framework registered in FrameworkFactory: plan_and_execute, react,
+  # codex, claude_code, dsh, dsh_mini, mini_swe
+  default_framework: plan_and_execute
+
+  # Sandbox data directory (relative to project root directory)
+  sandbox_data_dir: data/sandbox
+
+  # Plan-and-Execute framework configuration
+  plan_and_execute:
+    max_plan_iterations: 10     # Maximum plan iterations
+    max_worker_retries: 3       # Worker maximum retries
+
+  # React framework configuration
+  react:
+    max_iterations: 10          # Maximum inference-action loop iterations
+
+  # External CLI harnesses (codex / claude_code / dsh / dsh_mini / mini_swe).
+  # Launch parameters (bin, protocol, profile, timeouts) live in
+  # configs/harness/default.yaml; this block only carries the shared pointer to
+  # that file so a run can be relocated without editing each adapter.
+  harness:
+    config: configs/harness/default.yaml

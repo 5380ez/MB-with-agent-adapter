@@ -1,0 +1,554 @@
+"""Evaluation runner."""
+
+import json
+import logging
+from pathlib import Path
+
+import pandas as pd
+
+from mobility_bench.config.settings import Settings
+from mobility_bench.dataset.loader import DatasetLoader
+from mobility_bench.evaluation.registry import MetricRegistry
+
+logger = logging.getLogger(__name__)
+
+
+class EvaluationRunner:
+    """Evaluation runner.
+
+    Coordinates execution of multiple evaluation metrics, result collection and aggregation.
+    """
+
+    def __init__(
+        self,
+        run_dir: Path,
+        output_dir: Path,
+        ground_truth_path: Path | None = None,
+        settings: Settings | None = None,
+    ):
+        self.run_dir = Path(run_dir)
+        self.output_dir = Path(output_dir)
+        self.ground_truth_path = ground_truth_path
+        self.settings = settings or Settings.get_instance()
+
+        # Ensure output directory exists
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Load default metrics
+        MetricRegistry.load_default_metrics()
+
+        # Load data
+        self._load_data()
+
+    def _load_data(self):
+        """Load run results and ground truth data."""
+        # Load ground truth
+        if self.ground_truth_path and self.ground_truth_path.exists():
+            loader = DatasetLoader(self.settings)
+            self.cases = loader.load(str(self.ground_truth_path))
+            self.ground_truth_df = self._read_tabular(self.ground_truth_path)
+        else:
+            # Try loading dataset from run metadata
+            metadata_file = self.run_dir / "run_metadata.json"
+            dataset_name = None
+            if metadata_file.exists():
+                with open(metadata_file, encoding="utf-8") as f:
+                    metadata = json.load(f)
+                dataset_name = metadata.get("dataset")
+
+            loaded = False
+            if dataset_name:
+                try:
+                    loader = DatasetLoader(self.settings)
+                    self.cases = loader.load(dataset_name)
+                    loaded = True
+                    logger.info(f"Loaded ground truth from dataset: {dataset_name}")
+                except FileNotFoundError:
+                    logger.warning(f"Dataset '{dataset_name}' not found, trying defaults")
+
+            if not loaded:
+                # Try loading from default locations
+                default_paths = [
+                    Path("data/datasets/combine_6262.xlsx"),
+                ]
+                # Also search data/datasets for any available file
+                datasets_dir = Path("data/datasets")
+                if datasets_dir.exists():
+                    for ext in ["*.xlsx", "*.xls", "*.csv", "*.json"]:
+                        for f in datasets_dir.glob(ext):
+                            if f not in default_paths:
+                                default_paths.append(f)
+
+                for gt_path in default_paths:
+                    if gt_path.exists():
+                        try:
+                            loader = DatasetLoader(self.settings)
+                            self.cases = loader.load(str(gt_path))
+                            self.ground_truth_df = self._read_tabular(gt_path)
+                            loaded = True
+                            logger.info(f"Loaded ground truth from: {gt_path}")
+                            break
+                        except Exception as e:
+                            logger.warning(f"Failed to load {gt_path}: {e}")
+
+            if not loaded:
+                self.cases = []
+                self.ground_truth_df = pd.DataFrame()
+                logger.warning("No ground truth data found")
+
+        # Load model outputs
+        self.model_outputs = self._load_model_outputs()
+
+    @staticmethod
+    def _read_tabular(path: Path) -> pd.DataFrame:
+        """Read tabular file (xlsx/csv) into DataFrame."""
+        suffix = path.suffix.lower()
+        if suffix in [".xlsx", ".xls"]:
+            return pd.read_excel(path)
+        elif suffix == ".csv":
+            return pd.read_csv(path)
+        return pd.DataFrame()
+
+    # Directories to skip when scanning for model outputs
+    _SKIP_DIRS = {"evaluation", "comparison", "reports", "__pycache__"}
+
+    def _load_model_outputs(self) -> dict:
+        """Load model output files."""
+        outputs = {}
+
+        # Scan all model directories under run_dir
+        if self.run_dir.exists():
+            for model_dir in self.run_dir.iterdir():
+                if model_dir.is_dir() and model_dir.name not in self._SKIP_DIRS:
+                    model_name = model_dir.name
+                    outputs[model_name] = self._load_single_model_output(model_dir)
+
+        return outputs
+
+    def _load_single_model_output(self, model_dir: Path) -> dict:
+        """Load single model output.
+
+        Supports two formats:
+        1. Legacy format: separate xlsx/json files (planner_output_flattened.xlsx, etc.)
+        2. New format: raw_results.json generated by BatchRunner
+        """
+        output = {}
+
+        # --- Try legacy format files first ---
+        planner_file = model_dir / "planner_output_flattened.xlsx"
+        if planner_file.exists():
+            output["planner"] = pd.read_excel(planner_file)
+
+        worker_file = model_dir / "worker_1_6262.json"
+        if worker_file.exists():
+            with open(worker_file) as f:
+                output["worker"] = json.load(f)
+
+        reporter_file = model_dir / "reporter_output.xlsx"
+        if reporter_file.exists():
+            output["reporter"] = pd.read_excel(reporter_file)
+
+        function_call_file = model_dir / "last_function_call_with_source.xlsx"
+        if not function_call_file.exists():
+            function_call_file = model_dir / "excel_1_6262.xlsx"
+        if function_call_file.exists():
+            output["function_calls"] = pd.read_excel(function_call_file)
+
+        token_file = model_dir / "excel_1_6262.xlsx"
+        if token_file.exists():
+            output["tokens"] = pd.read_excel(token_file)
+
+        # --- If no legacy files found, try raw_results.json ---
+        if not output:
+            raw_file = model_dir / "raw_results.json"
+            if raw_file.exists():
+                output = self._load_from_raw_results(raw_file)
+
+        return output
+
+    def _load_from_raw_results(self, raw_file: Path) -> dict:
+        """Load and convert raw_results.json to the expected DataFrame format.
+
+        Args:
+            raw_file: Path to raw_results.json
+
+        Returns:
+            Dictionary with 'planner', 'function_calls', 'reporter', 'tokens' DataFrames
+        """
+        with open(raw_file, encoding="utf-8") as f:
+            raw_results = json.load(f)
+
+        if not isinstance(raw_results, list) or not raw_results:
+            return {}
+
+        output = {}
+
+        # --- Build planner DataFrame ---
+        planner_records = []
+        for r in raw_results:
+            planner = r.get("planner_output", {})
+            if not planner:
+                continue
+            steps_raw = planner.get("steps", "")
+            # Convert list-of-lists to readable string for regex matching
+            if isinstance(steps_raw, list):
+                flat_tasks = []
+                for step in steps_raw:
+                    if isinstance(step, list):
+                        flat_tasks.extend(step)
+                    else:
+                        flat_tasks.append(str(step))
+                steps_str = "; ".join(flat_tasks)
+            else:
+                steps_str = str(steps_raw)
+
+            planner_records.append({
+                "Case ID": r.get("case_id", ""),
+                "thinking": planner.get("thinking", ""),
+                "intent": planner.get("intent", ""),
+                "steps": steps_str,
+            })
+        if planner_records:
+            output["planner"] = pd.DataFrame(planner_records)
+
+        # --- Build function_calls DataFrame ---
+        fc_records = []
+        for r in raw_results:
+            for worker in r.get("worker_output", []):
+                for tc in worker.get("tool_calls", []):
+                    fc_records.append({
+                        "Case ID": r.get("case_id", ""),
+                        "name": tc.get("name", ""),
+                        "tool_name": tc.get("name", ""),
+                        "arguments": tc.get("args", {}),
+                        "tool_args": tc.get("args", {}),
+                    })
+        if fc_records:
+            output["function_calls"] = pd.DataFrame(fc_records)
+
+        # --- Build reporter DataFrame ---
+        reporter_records = []
+        for r in raw_results:
+            reporter_output = r.get("reporter_output", "")
+            if reporter_output:
+                reporter_records.append({
+                    "Case ID": r.get("case_id", ""),
+                    "reporter_response": reporter_output,
+                })
+        if reporter_records:
+            output["reporter"] = pd.DataFrame(reporter_records)
+
+        # --- Build tokens DataFrame ---
+        token_records = []
+        for r in raw_results:
+            token_usage = r.get("token_usage", {})
+            planner_t = token_usage.get("planner", {}) or {}
+            worker_t = token_usage.get("worker", {}) or {}
+            reporter_t = token_usage.get("reporter", {}) or {}
+            token_records.append({
+                "Case ID": r.get("case_id", ""),
+                "Planner_total_tokens": planner_t.get("total_tokens", 0),
+                "Planner_prompt_tokens": planner_t.get("prompt_tokens", 0),
+                "Planner_completion_tokens": planner_t.get("completion_tokens", 0),
+                "Worker_total_tokens": worker_t.get("total_tokens", 0),
+                "Worker_prompt_tokens": worker_t.get("prompt_tokens", 0),
+                "Worker_completion_tokens": worker_t.get("completion_tokens", 0),
+                "Reporter_total_tokens": reporter_t.get("total_tokens", 0),
+                "Reporter_prompt_tokens": reporter_t.get("prompt_tokens", 0),
+                "Reporter_completion_tokens": reporter_t.get("completion_tokens", 0),
+                "execution_time": r.get("execution_time", 0),
+            })
+        if token_records:
+            output["tokens"] = pd.DataFrame(token_records)
+
+        logger.info(
+            f"Loaded from raw_results.json: "
+            f"planner={len(planner_records)}, "
+            f"function_calls={len(fc_records)}, "
+            f"reporter={len(reporter_records)}, "
+            f"tokens={len(token_records)} records"
+        )
+
+        return output
+
+    def evaluate_metric(self, metric_name: str) -> dict:
+        """Execute single evaluation metric.
+
+        Args:
+            metric_name: Metric name
+
+        Returns:
+            Evaluation results dictionary
+        """
+        # Get metric configuration
+        eval_config = self.settings.evaluation
+        metric_config = getattr(eval_config, metric_name, {})
+
+        # Get metric instance
+        metric = MetricRegistry.get(metric_name, config=metric_config)
+        if metric is None:
+            raise ValueError(f"Unknown evaluation metric: {metric_name}")
+
+        logger.info(f"Executing evaluation: {metric_name}")
+
+        results = {}
+        for model_name, model_output in self.model_outputs.items():
+            logger.info(f"  Evaluating model: {model_name}")
+
+            # Prepare prediction and ground truth data
+            predictions = self._prepare_predictions(model_name, model_output, metric_name)
+            all_ground_truths = self._prepare_ground_truths(metric_name)
+
+            # Match predictions with ground truths by case_id
+            gt_by_id = {gt["case_id"]: gt for gt in all_ground_truths}
+            matched_preds = []
+            matched_gts = []
+            for pred in predictions:
+                case_id = pred.get("case_id", "")
+                if case_id in gt_by_id:
+                    matched_preds.append(pred)
+                    matched_gts.append(gt_by_id[case_id])
+                else:
+                    logger.warning(f"No ground truth found for case_id: {case_id}")
+
+            logger.info(f"  Matched {len(matched_preds)} / {len(predictions)} predictions with ground truths")
+
+            # Execute evaluation
+            metric_results = metric.batch_compute(matched_preds, matched_gts)
+
+            # Aggregate results
+            summary = metric.aggregate(metric_results)
+
+            # Aggregate by category
+            by_intent_family = metric.aggregate_by_category(metric_results, "intent_family")
+
+            results[model_name] = {
+                "results": metric_results,
+                "summary": summary,
+                "by_intent_family": by_intent_family,
+            }
+
+            # Save detailed results
+            df = metric.to_dataframe(metric_results)
+            output_file = self.output_dir / model_name / f"{metric_name}_evaluation.csv"
+            output_file.parent.mkdir(parents=True, exist_ok=True)
+            df.to_csv(output_file, index=False, encoding="utf-8-sig")
+
+        return results
+
+    def _prepare_predictions(
+        self,
+        model_name: str,
+        model_output: dict,
+        metric_name: str,
+    ) -> list[dict]:
+        """Prepare prediction data."""
+        predictions = []
+
+        # Select data source based on metric type
+        if metric_name == "tool":
+            df = model_output.get("function_calls", pd.DataFrame())
+            if not df.empty:
+                for case_id, group in df.groupby("Case ID"):
+                    predictions.append({
+                        "case_id": str(case_id),
+                        "tool_calls": group.to_dict("records"),
+                    })
+
+        elif metric_name == "instruction":
+            df = model_output.get("planner", pd.DataFrame())
+            if not df.empty:
+                for _, row in df.iterrows():
+                    predictions.append({
+                        "case_id": str(row.get("Case ID", "")),
+                        "thinking": row.get("thinking", ""),
+                        "intent": row.get("intent", ""),
+                        "steps": row.get("steps", ""),
+                    })
+
+        elif metric_name == "planning":
+            df = model_output.get("planner", pd.DataFrame())
+            if not df.empty:
+                for _, row in df.iterrows():
+                    predictions.append({
+                        "case_id": str(row.get("Case ID", "")),
+                        "steps": row.get("steps", ""),
+                    })
+
+        elif metric_name == "answer":
+            df = model_output.get("reporter", pd.DataFrame())
+            if not df.empty:
+                for _, row in df.iterrows():
+                    predictions.append({
+                        "case_id": str(row.get("Case ID", "")),
+                        "answer": row.get("reporter_response", ""),
+                    })
+
+        elif metric_name == "efficiency":
+            df = model_output.get("tokens", pd.DataFrame())
+            if not df.empty:
+                for _, row in df.iterrows():
+                    predictions.append({
+                        "case_id": str(row.get("Case ID", "")),
+                        "token_usage": row.to_dict(),
+                    })
+
+        return predictions
+
+    def _prepare_ground_truths(self, metric_name: str) -> list[dict]:
+        """Prepare ground truth data."""
+        ground_truths = []
+
+        for case in self.cases:
+            gt = {
+                "case_id": case.case_id,
+                "source_file": case.source_file,
+                "task_scenario": case.task_scenario,
+                "intent_family": case.intent_family,
+            }
+
+            if case.ground_truth:
+                gt["tool_list"] = case.ground_truth.tool_list
+                gt["llm_class"] = case.ground_truth.llm_class
+                gt["route_ans"] = case.ground_truth.route_ans
+                gt["weather_description"] = case.ground_truth.weather_description
+                gt["poi_result"] = case.ground_truth.poi_result
+
+            # Include metadata fields (e.g. query_start_poi, query_end_poi, city, road)
+            # so that metrics like instruction can access slot values for IE evaluation.
+            if case.metadata:
+                gt.update(case.metadata)
+
+            ground_truths.append(gt)
+
+        return ground_truths
+
+    def aggregate_results(self, results: dict) -> dict:
+        """Aggregate all evaluation results.
+
+        Args:
+            results: Evaluation results for each metric
+
+        Returns:
+            {
+                "overall": {metric: {model: {sub_dim: value}}},
+                "by_intent_family": {intent_family: {metric: {model: {sub_dim: value}}}},
+            }
+        """
+        overall = {}
+        by_intent_family: dict[str, dict] = {}
+
+        for metric_name, metric_results in results.items():
+            overall[metric_name] = {}
+
+            for model_name, model_results in metric_results.items():
+                # Overall sub_scores
+                model_summary = model_results.get("summary")
+                if model_summary and model_summary.sub_scores:
+                    overall[metric_name][model_name] = model_summary.sub_scores
+
+                # Per intent_family sub_scores
+                by_family = model_results.get("by_intent_family", {})
+                for family_name, family_summary in by_family.items():
+                    if not family_name:
+                        continue
+                    if family_name not in by_intent_family:
+                        by_intent_family[family_name] = {}
+                    if metric_name not in by_intent_family[family_name]:
+                        by_intent_family[family_name][metric_name] = {}
+                    if family_summary.sub_scores:
+                        by_intent_family[family_name][metric_name][model_name] = {
+                            "sub_scores": family_summary.sub_scores,
+                            "total_cases": family_summary.total_cases,
+                        }
+
+        return {"overall": overall, "by_intent_family": by_intent_family}
+
+    def save_results(self, results: dict, summary: dict):
+        """Save evaluation results.
+
+        Args:
+            results: Detailed results
+            summary: Aggregated summary with overall and by_intent_family
+        """
+        overall = summary.get("overall", {})
+        by_intent_family = summary.get("by_intent_family", {})
+
+        # Build summary records
+        summary_records = []
+
+        # Overall rows (intent_family = "")
+        for metric_name, metric_models in overall.items():
+            for model_name, sub_scores in metric_models.items():
+                if isinstance(sub_scores, dict):
+                    for sub_dim, value in sub_scores.items():
+                        summary_records.append({
+                            "intent_family": "",
+                            "metric": metric_name,
+                            "sub_dimension": sub_dim,
+                            "model": model_name,
+                            "value": value,
+                        })
+
+        # Per intent_family rows
+        for family_name, family_metrics in by_intent_family.items():
+            for metric_name, metric_models in family_metrics.items():
+                for model_name, model_data in metric_models.items():
+                    sub_scores = model_data.get("sub_scores", {})
+                    for sub_dim, value in sub_scores.items():
+                        summary_records.append({
+                            "intent_family": family_name,
+                            "metric": metric_name,
+                            "sub_dimension": sub_dim,
+                            "model": model_name,
+                            "value": value,
+                        })
+
+        if summary_records:
+            summary_df = pd.DataFrame(summary_records)
+            summary_file = self.output_dir / "evaluation_summary.csv"
+            summary_df.to_csv(summary_file, index=False, encoding="utf-8-sig")
+            logger.info(f"Summary results saved to: {summary_file}")
+
+        # Save complete results as JSON
+        results_file = self.output_dir / "evaluation_results.json"
+        with open(results_file, "w") as f:
+            serializable = {}
+            for metric_name, metric_results in results.items():
+                serializable[metric_name] = {}
+                for model_name, model_results in metric_results.items():
+                    by_family_ser = {}
+                    for fam, fam_summary in model_results.get("by_intent_family", {}).items():
+                        if fam:
+                            by_family_ser[fam] = fam_summary.to_dict()
+                    serializable[metric_name][model_name] = {
+                        "summary": model_results["summary"].to_dict() if model_results.get("summary") else None,
+                        "by_intent_family": by_family_ser,
+                    }
+            json.dump(serializable, f, ensure_ascii=False, indent=2)
+        logger.info(f"Detailed results saved to: {results_file}")
+
+    def run_all(self, metrics: list[str] | None = None) -> dict:
+        """Run all evaluations.
+
+        Args:
+            metrics: List of metrics to run, None for all
+
+        Returns:
+            All evaluation results
+        """
+        if metrics is None:
+            metrics = MetricRegistry.list_names()
+
+        all_results = {}
+        for metric_name in metrics:
+            try:
+                all_results[metric_name] = self.evaluate_metric(metric_name)
+            except Exception as e:
+                logger.error(f"Evaluation {metric_name} failed: {e}")
+                all_results[metric_name] = {"error": str(e)}
+
+        summary = self.aggregate_results(all_results)
+        self.save_results(all_results, summary)
+
+        return all_results
