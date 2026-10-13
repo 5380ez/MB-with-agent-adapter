@@ -13,6 +13,7 @@ per-harness adapters stay small.
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -134,72 +135,158 @@ def normalize_usage(usage: dict) -> dict:
     }
 
 
-def extract_steps(messages: list[str]) -> list[list[str]]:
-    """The planning metric reads ``planner_training_data['steps']``.
+# --- intent and planning-step inference from ACTUAL tool behavior ---
+#
+# External CLIs never utter the benchmark's intent vocabulary, but they DO reveal
+# intent and the plan through which sandbox tools they actually call. Everything
+# below is therefore driven by the tool trajectory — never by query keywords or
+# the final answer text — so "I queried X" without really calling X earns nothing.
 
-    CLI harnesses do not emit an explicit plan, so derive coarse steps from the
-    final assistant message to give the metric something to compare.
+# Route tools: any of these means the agent performed route planning.
+_ROUTE_TOOLS = frozenset({"driving_route", "bus_route", "walking_route", "bicycling_route"})
+_ROUTE_KIND = {
+    "driving_route": "驾车",
+    "bus_route": "公交",
+    "walking_route": "步行",
+    "bicycling_route": "骑行",
+}
+
+# tool name -> intent label, in priority order (first called tool wins). Route
+# tools are handled separately so 距离/出发时间 can refine 路线规划.
+_INTENT_BY_TOOL: tuple[tuple[str, str], ...] = (
+    ("weather_query", "天气查询"),
+    ("traffic_status", "拥堵"),
+    ("reverse_geocoding", "位置查询"),
+    ("search_around_poi", "附近周边搜索"),
+)
+
+# Distance / departure-time projection. These two intents project only when a
+# route tool fired AND the final answer actually states a distance / a concrete
+# time; the query text is merely a confirmation gate and never assigns intent.
+_DISTANCE_WORDS = ("多远", "多少公里", "距离", "有多远", "路程", "几公里", "里程")
+_TIME_WORDS = ("几点出发", "几点走", "出发时间", "什么时候出发", "提前多久", "几点到", "应该几点")
+
+_DISTANCE_RE = re.compile(r"\d+(?:\.\d+)?\s*(?:公里|千米|米|km)", re.IGNORECASE)
+_TIME_RE = re.compile(r"\d{1,2}[:：]\d{2}|\d{1,2}点(?:\d{1,2}分)?", re.IGNORECASE)
+
+
+def _has_word(text: str, words: tuple[str, ...]) -> bool:
+    return any(w in (text or "") for w in words)
+
+
+def _is_meaningful(value: Any) -> bool:
+    """True for a non-default strategy/waypoints value (the '有' in 有strategy)."""
+    if isinstance(value, list):
+        return bool(value)
+    if value is None:
+        return False
+    return str(value).strip() not in ("", "0", "[]", "None")
+
+
+def _fmt_arg(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value).strip()
+
+
+def _fmt_list(value: Any) -> str:
+    if isinstance(value, list):
+        return "、".join(str(v) for v in value)
+    return str(value)
+
+
+def _step_for_call(name: str, args: dict) -> str | None:
+    """One planning step (with its arguments) for one tool call, or None.
+
+    The wording satisfies the PlanningMetric regexes (定位/路线规划/有偏好的路线
+    规划/途径点路线规划/…), while the inlined arguments let IE/DEC check the real
+    values the agent handed to the tools.
     """
-    if not messages:
-        return []
-    text = messages[-1]
+    if name == "query_poi":
+        return f"定位坐标：{_fmt_arg(args.get('keywords'))}（{_fmt_arg(args.get('city'))}）"
+    if name == "weather_query":
+        return f"查询天气，{_fmt_arg(args.get('city'))}"
+    if name == "traffic_status":
+        return f"查询路况，{_fmt_arg(args.get('name'))}（{_fmt_arg(args.get('city'))}）"
+    if name == "reverse_geocoding":
+        return f"定位坐标：{_fmt_arg(args.get('longitude'))},{_fmt_arg(args.get('latitude'))}"
+    if name == "search_around_poi":
+        return f"附近周边搜索：{_fmt_arg(args.get('location'))} {_fmt_arg(args.get('keywords'))}"
+    if name in _ROUTE_TOOLS:
+        kind = _ROUTE_KIND.get(name, "")
+        origin = _fmt_arg(args.get("origin"))
+        destination = _fmt_arg(args.get("destination"))
+        waypoints = args.get("waypoints")
+        strategy = args.get("strategy")
+        if _is_meaningful(waypoints):
+            return f"途径点路线规划：{origin} → {_fmt_list(waypoints)} → {destination}"
+        if _is_meaningful(strategy):
+            # The label alone satisfies the DEC regex; inlining the strategy value
+            # (e.g. "不走高速") would leak the bare 走 into the text and fake a
+            # 步行路线规划 match.
+            return f"有偏好的路线规划：{origin} → {destination}"
+        return f"{kind}路线规划：{origin} → {destination}"
+    # Any other tool (bash, str_replace_editor, ...) does not map to a planning step.
+    return None
+
+
+def extract_steps_from_trajectory(
+    tool_calls: list[dict], final_message: str
+) -> list[list[str]]:
+    """Derive planning steps from the ACTUAL tool trajectory, not the answer.
+
+    The metrics read ``steps`` (IE uses ``thinking + steps``; DEC regex-matches
+    the flattened text). Steps come from the tools the agent really called, with
+    their arguments inlined. The final answer contributes only the departure-time
+    back-calculation step (there is no tool for it).
+    """
     steps: list[list[str]] = []
-    for raw in text.splitlines():
-        line = raw.strip().lstrip("-*•0123456789. \t")
-        if 0 < len(line) < 120:
-            steps.append([line])
-    return steps[:20]
+    route_completed = False
+    for tc in tool_calls:
+        name = tc.get("name", "")
+        args = tc.get("args") or {}
+        if not isinstance(args, dict):
+            args = {}
+        step = _step_for_call(name, args)
+        if step:
+            steps.append([step])
+        if name in _ROUTE_TOOLS:
+            route_completed = True
+    if route_completed and _TIME_RE.search(final_message or ""):
+        steps.append(["出发时间倒推计算"])
+    return steps
 
 
-# Classification rules keyed on the *user query* rather than the agent's own
-# wording: these CLIs never utter the benchmark's intent vocabulary ("位置查询",
-# "距离", ...), they just reason about the request, so matching on agent text
-# collapsed most cases into "路线规划". Ordered by priority; the first match
-# wins. Values mirror InstructionMetric.TASK_SCENARIO_TO_INTENT_SLOTS.
-_INTENT_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("出发时间", ("几点出发", "几点走", "什么时候出发", "出发时间", "几点到", "我应该几点")),
-    ("位置查询", ("我在哪", "哪里", "位置", "坐标", "经度", "纬度", "什么地方", "这是哪", "这在哪")),
-    ("拥堵", ("堵", "拥堵", "事故", "路况")),
-    ("天气查询", ("天气", "气温", "下雨", "温度")),
-    ("距离", ("多远", "多少公里", "距离", "有多远")),
-    ("附近周边搜索", ("附近", "周边")),
-)
-# Labels mirror the instruction metric's task_scenario -> intent mapping so the
-# inferred intent lands in the benchmark's vocabulary.
-_INTENT_LABELS = (
-    "路线规划", "地点查询", "位置查询", "附近周边搜索",
-    "天气查询", "拥堵", "距离", "出发时间",
-)
-# Queries that are themselves a bare "where am I" question.
-_SHORT_POSITION_QUERIES = ("在哪", "在哪里", "这是哪", "这在哪", "什么地方")
-# Motion/route words; a query with none of these and no rule match above is
-# treated as a bare place lookup.
-_ROUTE_KEYWORDS = (
-    "去", "到", "怎么走", "路线", "导航", "前往", "开车", "坐公交", "坐地铁",
-    "乘车", "驾车", "骑车", "步行", "换乘", "不走", "优先", "高速", "低速",
-)
+def infer_intent(tool_calls: list[dict], final_message: str, query: str) -> str:
+    """Infer intent from the agent's tool behavior, never from query keywords.
 
-
-def infer_intent(query: str, text: str) -> str:
-    """The instruction metric reads ``planner_training_data['intent']``.
-
-    These CLIs do not emit an explicit intent. Classify the request from the user
-    query (reliable, mirrors the benchmark's own scenario labels), then fall back
-    to the agent's wording. Never echo raw reasoning: truncating a ``<think>``
-    block into ``intent`` guarantees a similarity miss and pollutes the field.
+    No mapped tool -> empty intent, so an agent that only talks earns nothing on
+    ID. Route tools project ``路线规划``, refined to ``距离``/``出发时间`` only
+    when the final answer actually states a distance / time (query is a mere
+    confirmation gate). ``query_poi`` alone -> 地点查询, but it never overrides
+    the route/info tools.
     """
-    q = (query or "").strip()
-    if q in _SHORT_POSITION_QUERIES:
-        return "位置查询"
-    for label, keywords in _INTENT_RULES:
-        if any(k in q for k in keywords):
+    names = {tc.get("name", "") for tc in tool_calls}
+    if not names:
+        return ""
+    for tool, label in _INTENT_BY_TOOL:
+        if tool in names:
             return label
-    if q and not any(k in q for k in _ROUTE_KEYWORDS):
+    if names & _ROUTE_TOOLS:
+        text = final_message or ""
+        if _has_word(query, _DISTANCE_WORDS) and _DISTANCE_RE.search(text):
+            return "距离"
+        if _has_word(query, _TIME_WORDS) and _TIME_RE.search(text):
+            return "出发时间"
+        return "路线规划"
+    # query_poi alone -> 地点查询. It must sit after the route/info tools because
+    # it is also their shared "locate a place" precursor and must not override them.
+    if "query_poi" in names:
         return "地点查询"
-    for label in _INTENT_LABELS:
-        if label in (text or ""):
-            return label
-    return "路线规划"
+    return ""
+
 
 
 def build_worker_output(tool_calls: list[dict]) -> list[dict]:
@@ -229,14 +316,18 @@ def standard_result(
     usage: dict,
     query: str,
 ) -> dict[str, Any]:
-    """Assemble the runner contract result from a parsed CLI transcript."""
-    joined = "\n".join(reasoning) + "\n" + final_message
+    """Assemble the runner contract result from a parsed CLI transcript.
+
+    Intent and planning steps are derived from the ACTUAL tool trajectory (see
+    ``infer_intent`` / ``extract_steps_from_trajectory``), never from the query
+    wording or the answer text.
+    """
     return {
         "plan_result": final_message,
         "planner_training_data": {
-            "steps": extract_steps([final_message] if final_message else []),
+            "steps": extract_steps_from_trajectory(tool_calls, final_message),
             "thinking": "\n".join(reasoning)[:4000],
-            "intent": infer_intent(query, joined),
+            "intent": infer_intent(tool_calls, final_message, query),
         },
         "worker_training_data": build_worker_output(tool_calls),
         "token_usage": {

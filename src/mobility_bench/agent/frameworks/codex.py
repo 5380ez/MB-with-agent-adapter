@@ -27,7 +27,6 @@ from mobility_bench.agent.frameworks._cli_common import (
     MCP_SERVER,
     VENV_PY,
     build_prompt,
-    infer_intent,
     parse_jsonl,
     resolve_bin,
     standard_result,
@@ -188,10 +187,4 @@ default_tools_approval_mode = "approve"
             usage=usage,
             query=final_state.get("query", ""),
         )
-
-
-# ``recompute_intent.py`` calls ``CodexFramework._infer_intent`` to refresh the
-# intent field in existing runs. Keep it as a thin alias onto the shared
-# implementation so that script keeps working unchanged.
-CodexFramework._infer_intent = staticmethod(infer_intent)
 

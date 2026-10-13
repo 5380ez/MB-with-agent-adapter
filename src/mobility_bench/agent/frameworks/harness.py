@@ -18,14 +18,16 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 _DEFAULTS: dict[str, dict] = {
     "codex": {"bin": "codex", "wire_api": "responses", "context_window": 32768},
     "claude_code": {"bin": "claude", "protocol": "anthropic"},
-    # dsh boots a named profile; the one-shot app lives in ``headless``. Both
-    # dsh arms mount the sandbox MCP client: without it the profile's only tool
-    # is a built-in ``web_search`` that requires a DeepSeek key and fails on
-    # every call, so the agent never reaches the sandbox. The arms differ in
-    # model context window (token budget), not in whether the sandbox is reachable.
+    # dsh boots a named profile. The full arm uses the one-shot ``headless``
+    # profile; the minimal arm uses the standalone ``sdk-minimal`` tree, driven
+    # over the SDK JSON-RPC protocol. Both mount the sandbox MCP client.
     "dsh": {"bin": "dsh", "protocol": "openai", "profile": "headless", "mcp_client": True},
-    "dsh_mini": {"bin": "dsh", "protocol": "openai", "profile": "headless", "mcp_client": True, "context_window": 16384},
+    "dsh_mini": {"bin": "dsh", "protocol": "openai", "profile": "sdk-minimal", "mcp_client": True},
     "mini_swe": {"bin": "mini", "protocol": "openai", "mcp_client": False},
+    # openclaw: `agent --local --json` one-shot embedded turn, sandbox over MCP.
+    "openclaw": {"bin": "openclaw", "protocol": "openai", "context_window": 32768, "mcp_client": True},
+    # hermes: in-process driver over `hermes_cli.oneshot`, sandbox over MCP.
+    "hermes": {"bin": "hermes", "protocol": "openai", "context_window": 32768, "mcp_client": True},
 }
 
 

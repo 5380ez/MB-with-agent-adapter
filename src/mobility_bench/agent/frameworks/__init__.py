@@ -3,14 +3,16 @@ Agent frameworks module.
 
 This module provides the framework factory and base classes for different
 agent architectures (Plan-and-Execute, ReAct) and for external CLI harnesses
-(codex, Claude Code, dsh, dsh-mini, mini-swe-agent).
+(codex, Claude Code, dsh, dsh-mini, mini-swe-agent, openclaw, hermes).
 """
 
 from mobility_bench.agent.frameworks.base import BaseFramework
 from mobility_bench.agent.frameworks.claude_code import ClaudeCodeFramework
 from mobility_bench.agent.frameworks.codex import CodexFramework
 from mobility_bench.agent.frameworks.dsh import DshFramework, DshMiniFramework
+from mobility_bench.agent.frameworks.hermes import HermesFramework
 from mobility_bench.agent.frameworks.mini_swe import MiniSweFramework
+from mobility_bench.agent.frameworks.openclaw import OpenclawFramework
 from mobility_bench.agent.frameworks.plan_and_execute import PlanAndExecuteFramework
 from mobility_bench.agent.frameworks.react import ReactFramework
 from mobility_bench.config.settings import ModelConfig, Settings
@@ -32,6 +34,8 @@ class FrameworkFactory:
         "dsh": DshFramework,
         "dsh_mini": DshMiniFramework,
         "mini_swe": MiniSweFramework,
+        "openclaw": OpenclawFramework,
+        "hermes": HermesFramework,
     }
 
     @classmethod
@@ -96,7 +100,9 @@ __all__ = [
     "DshFramework",
     "DshMiniFramework",
     "FrameworkFactory",
+    "HermesFramework",
     "MiniSweFramework",
+    "OpenclawFramework",
     "PlanAndExecuteFramework",
     "ReactFramework",
 ]

@@ -51,18 +51,17 @@ harnesses:
     timeout: 900
     mcp_client: true
 
-  # dsh-mini: the same CLI and profile as ``dsh``, but with a halved model
-  # context window (the paper's lightweight arm: a smaller per-run token budget).
-  # The sandbox MCP client is mounted too — without it the profile only exposes
-  # its built-in ``web_search`` tool, which needs a DeepSeek key and fails on
-  # every call, so the agent can never reach the sandbox at all.
+  # dsh-mini: the paper's minimal arm — dsh's standalone ``sdk-minimal`` profile
+  # (no dsh-base: a persistent shell plus the sandbox MCP tools mounted by the
+  # adapter's ``--patch`` overlay). Driven over the SDK JSON-RPC protocol, not
+  # the one-shot ``--json`` mode the full ``headless`` arm uses.
   dsh_mini:
     bin: dsh
     protocol: openai
     wire_api: chat
-    profile: headless
+    profile: sdk-minimal
     version: ""
-    context_window: 16384
+    context_window: 32768
     timeout: 900
     mcp_client: true
 
@@ -78,3 +77,34 @@ harnesses:
     timeout: 900
     max_steps: 0
     mcp_client: false
+
+  # openclaw: a multi-channel AI gateway whose `agent --local --json` runs one
+  # embedded agent turn (no gateway daemon) — the codex-`exec` / claude-`-p`
+  # analogue. The adapter writes a per-run openclaw.json (vllm provider +
+  # sandbox MCP server); the reply and token usage come from the --json stdout
+  # and the tool trajectory from the session-transcript JSONL.
+  openclaw:
+    bin: openclaw
+    protocol: openai
+    wire_api: chat
+    version: "2026.7.1"
+    context_window: 32768
+    max_output_tokens: 4096
+    timeout: 900
+    mcp_client: true
+
+  # hermes: Nous Research hermes-agent, driven through an in-process one-shot
+  # driver over `hermes_cli.oneshot`. The adapter writes a per-run
+  # HERMES_HOME/config.yaml (custom provider -> local vLLM + sandbox MCP); the
+  # driver returns the answer + token usage and the tool trajectory is read
+  # from the session transcript. hermes enforces a 64K context floor, so its
+  # config declares 65536 while the served window stays 32768 for short tasks.
+  hermes:
+    bin: hermes
+    protocol: openai
+    wire_api: chat
+    version: "v2026.5.7"
+    context_window: 32768
+    max_output_tokens: 4096
+    timeout: 900
+    mcp_client: true

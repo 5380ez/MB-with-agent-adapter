@@ -1,9 +1,10 @@
 """Recompute planner_output.intent in an existing run's raw_results.json.
 
-Used when the intent-classification rules in ``codex.py`` change but the (long)
-codex run does not need to be re-executed: eval only reads raw_results.json, so
-rewriting the intent field in place and re-running ``mbench eval`` refreshes the
-instruction metric without paying for the run again.
+Intent is derived from the actual tool trajectory (``worker_output``) plus the
+final answer (``reporter_output``) and the query — never from
+``task_scenario``/``intent_family``/``ans`` — so it can be recomputed without
+re-running the agent. Rewrite the intent field in place, then re-run
+``mbench eval`` to refresh the instruction metric for free.
 
 Usage:
     .venv/bin/python scripts/recompute_intent.py <run_dir> <dataset_csv>
@@ -16,7 +17,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from mobility_bench.agent.frameworks.codex import CodexFramework  # noqa: E402
+from mobility_bench.agent.frameworks._cli_common import infer_intent  # noqa: E402
 
 
 def main(run_dir: str, dataset_csv: str) -> None:
@@ -39,15 +40,19 @@ def main(run_dir: str, dataset_csv: str) -> None:
             if not query:
                 continue
             planner = item.get("planner_output") or {}
-            new_intent = CodexFramework._infer_intent(query, planner.get("thinking", ""))
+            tool_calls = [
+                {"name": tc.get("name", ""), "args": tc.get("args", {})}
+                for worker in (item.get("worker_output") or [])
+                for tc in (worker.get("tool_calls") or [])
+            ]
+            final_message = item.get("reporter_output", "")
+            new_intent = infer_intent(tool_calls, final_message, query)
             if planner.get("intent") != new_intent:
                 changed += 1
                 planner["intent"] = new_intent
                 item["planner_output"] = planner
 
-        raw_file.write_text(
-            json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        raw_file.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"{raw_file}: updated {changed}/{len(raw)} intents")
 
 
