@@ -24,12 +24,47 @@ PROJECT_ROOT = Path(__file__).resolve().parents[4]
 MCP_SERVER = PROJECT_ROOT / "mcp_server" / "sandbox_tools.py"
 VENV_PY = PROJECT_ROOT / ".venv" / "bin" / "python"
 
-PROMPT_TEMPLATE = (
-    "你是出行路线规划助手，请使用 sandbox 提供的工具查询真实数据来完成任务，"
-    "不要凭记忆编造坐标或路线。完成后用中文给出简洁、明确的最终答复。\n"
-    "当前上下文（含用户位置、城市等）: {context}\n"
-    "用户请求: {query}\n"
-)
+PROMPT_TEMPLATE = """
+你是出行任务助手。请先在内部识别用户请求中的地点、约束和目标，制定最短可执行计划，然后调用 sandbox 提供的工具完成任务。不要在最终答案中输出分析过程或计划。
+
+【任务理解要求】
+在调用工具前，必须识别：
+1. 地点：起点、终点、途经点、查询位置及城市。
+2. 约束：出行方式、时间、距离、费用、换乘、道路偏好及其他限制。
+3. 目标：用户希望查询、比较、推荐或规划的具体结果。
+4. 缺失信息：优先通过工具补充；只有工具无法获得时才视为缺失。
+
+【工具使用规则】
+1. 可用工具：
+   query_poi、search_around_poi、driving_route、bus_route、walking_route、
+   bicycling_route、weather_query、traffic_status、reverse_geocoding。
+2. 必须使用工具获取坐标、距离、耗时、费用、天气和路况等事实，不得猜测或编造。
+3. 只调用完成当前任务所必需的工具。
+4. 工具调用总数最多为 15 次，这只是安全边界，不要因此而减少必要的工具调用。
+5. 路线规划工具合计最多调用 2 次。
+6. 同一工具使用完全相同的参数最多调用 1 次。
+7. 每次调用前检查已有结果，避免重复查询已经获得的信息。
+8. 达到调用上限仍无法完成时，应说明缺失信息，不得编造结果。
+9. 工具返回多条路线时，根据用户约束选择方案；route_index 必须是该方案在工具返回数组中的零起始索引。
+
+【任务】
+当前上下文（含用户位置、城市等）：
+{context}
+
+用户请求：
+{query}
+
+【最终输出】
+完成后只输出一个合法 JSON 对象，不要输出 Markdown、代码块、分析过程、计划或其他文字：
+
+{{"intent":"","route_index":"","content":"","route_info":""}}
+
+字段要求：
+- intent：先判断该请求的意图，并从以下标签中选一个填入：地点查询、位置查询、附近周边搜索、天气查询、拥堵、距离、出发时间、路线规划。
+- route_index：路线任务填写所选方案在工具返回数组中的零起始索引；没有可用路线填写 "-1"；信息查询任务填写空字符串。
+- content：直接回答用户问题，或简要说明推荐方案及理由。
+- route_info：填写路线详情或查询结果，其中坐标、距离、耗时、费用、天气和路况等事实必须来自工具返回。
+"""
 
 
 def resolve_bin(env_var: str, default: str) -> str:
@@ -137,10 +172,11 @@ def normalize_usage(usage: dict) -> dict:
 
 # --- intent and planning-step inference from ACTUAL tool behavior ---
 #
-# External CLIs never utter the benchmark's intent vocabulary, but they DO reveal
-# intent and the plan through which sandbox tools they actually call. Everything
-# below is therefore driven by the tool trajectory — never by query keywords or
-# the final answer text — so "I queried X" without really calling X earns nothing.
+# Planning steps are derived from the ACTUAL tool trajectory — which sandbox tools
+# were really called, and with which arguments — never from query keywords or the
+# final answer text, so "I queried X" without really calling X earns nothing.
+# Intent is NOT inferred here: the prompt makes the agent classify it itself (see
+# ``extract_intent_from_answer``).
 
 # Route tools: any of these means the agent performed route planning.
 _ROUTE_TOOLS = frozenset({"driving_route", "bus_route", "walking_route", "bicycling_route"})
@@ -151,27 +187,9 @@ _ROUTE_KIND = {
     "bicycling_route": "骑行",
 }
 
-# tool name -> intent label, in priority order (first called tool wins). Route
-# tools are handled separately so 距离/出发时间 can refine 路线规划.
-_INTENT_BY_TOOL: tuple[tuple[str, str], ...] = (
-    ("weather_query", "天气查询"),
-    ("traffic_status", "拥堵"),
-    ("reverse_geocoding", "位置查询"),
-    ("search_around_poi", "附近周边搜索"),
-)
-
-# Distance / departure-time projection. These two intents project only when a
-# route tool fired AND the final answer actually states a distance / a concrete
-# time; the query text is merely a confirmation gate and never assigns intent.
-_DISTANCE_WORDS = ("多远", "多少公里", "距离", "有多远", "路程", "几公里", "里程")
-_TIME_WORDS = ("几点出发", "几点走", "出发时间", "什么时候出发", "提前多久", "几点到", "应该几点")
-
-_DISTANCE_RE = re.compile(r"\d+(?:\.\d+)?\s*(?:公里|千米|米|km)", re.IGNORECASE)
+# The departure-time back-calculation is the one planning step with no tool behind
+# it, so ``extract_steps_from_trajectory`` detects a concrete time in the answer.
 _TIME_RE = re.compile(r"\d{1,2}[:：]\d{2}|\d{1,2}点(?:\d{1,2}分)?", re.IGNORECASE)
-
-
-def _has_word(text: str, words: tuple[str, ...]) -> bool:
-    return any(w in (text or "") for w in words)
 
 
 def _is_meaningful(value: Any) -> bool:
@@ -259,33 +277,30 @@ def extract_steps_from_trajectory(
     return steps
 
 
-def infer_intent(tool_calls: list[dict], final_message: str, query: str) -> str:
-    """Infer intent from the agent's tool behavior, never from query keywords.
+def extract_intent_from_answer(answer: str) -> str:
+    """Read the model's intent classification out of its final JSON answer.
 
-    No mapped tool -> empty intent, so an agent that only talks earns nothing on
-    ID. Route tools project ``路线规划``, refined to ``距离``/``出发时间`` only
-    when the final answer actually states a distance / time (query is a mere
-    confirmation gate). ``query_poi`` alone -> 地点查询, but it never overrides
-    the route/info tools.
+    Intent is no longer inferred from the tool trajectory: the prompt asks the
+    agent to classify the request itself and return the chosen label in
+    ``intent``. Returns "" when the answer is empty, not JSON, or carries no
+    string ``intent`` — an agent that ignores the contract earns nothing on ID.
     """
-    names = {tc.get("name", "") for tc in tool_calls}
-    if not names:
+    text = (answer or "").strip()
+    if not text:
         return ""
-    for tool, label in _INTENT_BY_TOOL:
-        if tool in names:
-            return label
-    if names & _ROUTE_TOOLS:
-        text = final_message or ""
-        if _has_word(query, _DISTANCE_WORDS) and _DISTANCE_RE.search(text):
-            return "距离"
-        if _has_word(query, _TIME_WORDS) and _TIME_RE.search(text):
-            return "出发时间"
-        return "路线规划"
-    # query_poi alone -> 地点查询. It must sit after the route/info tools because
-    # it is also their shared "locate a place" precursor and must not override them.
-    if "query_poi" in names:
-        return "地点查询"
-    return ""
+    # Tolerate a ```json fence even though the prompt forbids Markdown.
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*[ \t]*\n?|\n?```$", "", text).strip()
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict):
+        value = parsed.get("intent", "")
+        return value.strip() if isinstance(value, str) else ""
+    # Fall back to a bare "intent": "..." scan when the JSON is malformed.
+    match = re.search(r'"intent"\s*:\s*"([^"]*)"', text)
+    return match.group(1).strip() if match else ""
 
 
 
@@ -318,16 +333,16 @@ def standard_result(
 ) -> dict[str, Any]:
     """Assemble the runner contract result from a parsed CLI transcript.
 
-    Intent and planning steps are derived from the ACTUAL tool trajectory (see
-    ``infer_intent`` / ``extract_steps_from_trajectory``), never from the query
-    wording or the answer text.
+    Planning steps are derived from the ACTUAL tool trajectory (see
+    ``extract_steps_from_trajectory``); intent is the classification the agent
+    itself produced in its final JSON answer (see ``extract_intent_from_answer``).
     """
     return {
         "plan_result": final_message,
         "planner_training_data": {
             "steps": extract_steps_from_trajectory(tool_calls, final_message),
             "thinking": "\n".join(reasoning)[:4000],
-            "intent": infer_intent(tool_calls, final_message, query),
+            "intent": extract_intent_from_answer(final_message),
         },
         "worker_training_data": build_worker_output(tool_calls),
         "token_usage": {
