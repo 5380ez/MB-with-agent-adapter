@@ -1,0 +1,5 @@
+{
+  "route_index": "0",
+  "content": "驾车路线已规划完成。目的地为福通建材市场，位于云南省普洱市思茅区永平路与白云路交叉口南 240 米。",
+  "route_info": {"distance": "198984", "duration": 9555, "tolls": 119, "steps": [{"instruction": "沿海关路向西行驶 69 米左转调头", "road_name": "海关路"}, {"instruction": "沿海关路向东行驶 660 米进入环岛绕环岛直行", "road_name": "海关路"}, {"instruction": "沿城东路途径 309 省道、219 国道向东北行驶 7.4 千米", "road_name": "城东路"}, {"instruction": "沿 219 国道向东北行驶 8.6 千米", "road_name": "219 国道"}, {"instruction": "沿朗勒隧道途径 219 国道向东行驶 8.1 千米", "road_name": "朗勒隧道"}, {"instruction": "沿阿永隧道途径 219 国道向东北行驶 15.5 千米", "road_name": "阿永隧道"}, {"instruction": "沿 227 国道途径澜沧江大桥向东行驶 77.9 千米", "road_name": "227 国道"}, {"instruction": "向北到达目的地", "road_name": "宁洱大道"}]
+}
