@@ -36,31 +36,109 @@ except Exception:
     MAX_REACT_ITERATIONS = 15
 
 
-def _parse_react_response(content: str) -> dict[str, Any]:
-    """Parse ReAct JSON response from LLM output."""
-    # Try to extract JSON from content
-    content = content.strip()
+_REPAIR_PROMPT = (
+    "上一条回复不是合法的 ReAct JSON。请只输出一个 JSON 对象，不要附带任何解释文字、"
+    "不要使用 Markdown：调用工具时为 "
+    '{"intent": "...", "thought": "...", "action": "call_tool", "tool_name": "...", "tool_args": {...}}，'
+    "结束时为 "
+    '{"intent": "...", "thought": "...", "action": "finish", "final_answer": "...", '
+    '"route_index": "...", "route_info": "..."}。'
+    "intent 从「地点查询、位置查询、附近周边搜索、天气查询、拥堵、距离、出发时间、路线规划」中选一个；"
+    'route_index 为选定路线在 paths 中从 0 开始的索引（字符串），无可用路线填 "-1"，非路线任务填空字符串。'
+)
 
-    # Try to find JSON block
-    json_match = re.search(r'```json\s*(.*?)\s*```', content, re.DOTALL)
+
+def _parse_react_response(content: str) -> dict[str, Any] | None:
+    """Parse one ReAct turn into ``{thought, action, tool_name, tool_args}``.
+
+    Accepts the JSON object the prompt asks for and, as a fallback, the plain
+    ``Thought:/Action:`` transcript form models drift into once that form shows
+    up in the message history. Returns None when neither can be read, so the
+    caller can ask the model to repair its reply instead of ending the case.
+    """
+    text = (content or "").strip()
+
+    candidate = text
+    json_match = re.search(r'```json\s*(.*?)\s*```', text, re.DOTALL)
     if json_match:
-        content = json_match.group(1)
+        candidate = json_match.group(1)
     else:
-        # Try to find raw JSON object
-        json_match = re.search(r'\{.*\}', content, re.DOTALL)
+        json_match = re.search(r'\{.*\}', text, re.DOTALL)
         if json_match:
-            content = json_match.group(0)
+            candidate = json_match.group(0)
 
     try:
-        return json.loads(content)
+        parsed = json.loads(candidate)
+        if isinstance(parsed, dict) and parsed.get("action"):
+            return parsed
     except json.JSONDecodeError as e:
-        logger.warning(f"[REACT] Failed to parse JSON response: {e}")
-        # Return a default finish action if parsing fails
-        return {
-            "thought": "Unable to parse response, ending with available information.",
-            "action": "finish",
-            "final_answer": content
-        }
+        logger.warning(f"[REACT] JSON parse failed ({e}), trying text form")
+
+    action_match = re.search(r'Action\s*[:：]\s*["\']?(\w+)', text)
+    if not action_match or action_match.group(1) not in {"call_tool", "finish"}:
+        logger.warning(f"[REACT] Unparseable response: {text[:500]!r}")
+        return None
+
+    action = action_match.group(1)
+    thought = re.sub(r'^Thought\s*[:：]\s*', '', text[:action_match.start()].strip())
+
+    tool_name = ""
+    tool_args: dict[str, Any] = {}
+    if action == "call_tool":
+        name_match = re.search(r'tool_name\s*[:：]\s*["\']?([\w.\-]+)', text)
+        tool_name = name_match.group(1) if name_match else ""
+        args_match = re.search(r'tool_args\s*[:：]\s*(\{.*\})', text, re.DOTALL)
+        if args_match:
+            try:
+                parsed_args = json.loads(args_match.group(1))
+                if isinstance(parsed_args, dict):
+                    tool_args = parsed_args
+            except json.JSONDecodeError:
+                pass
+        if not tool_name:
+            logger.warning(f"[REACT] Text action without tool_name: {text[:500]!r}")
+            return None
+
+    logger.warning(f"[REACT] Recovered text-form response: action={action} tool={tool_name}")
+    return {
+        "thought": thought,
+        "action": action,
+        "tool_name": tool_name,
+        "tool_args": tool_args,
+        "final_answer": text if action == "finish" else "",
+    }
+
+
+def _accumulate_usage(previous: dict | None, response: Any, llm: Any) -> dict:
+    """Add one call's usage onto the running total and emit an ``llm_call`` event.
+
+    react is a loop (reason -> action -> reason -> ...) and the efficiency
+    metric sums per-iteration usage across the whole trajectory.
+    """
+    step_prompt = step_completion = step_total = 0
+    if getattr(response, "usage_metadata", None):
+        usage = response.usage_metadata
+        step_prompt = usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0
+        step_completion = usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0
+        step_total = usage.get("total_tokens", step_prompt + step_completion) or (
+            step_prompt + step_completion
+        )
+        log_event(
+            event_type="llm_call",
+            payload={
+                "model": getattr(llm, "model_name", str(llm)),
+                "role": "react_reasoning",
+                "prompt_tokens": step_prompt,
+                "completion_tokens": step_completion,
+                "total_tokens": step_total,
+            },
+        )
+
+    total = dict(previous or {})
+    total["prompt_tokens"] = total.get("prompt_tokens", 0) + step_prompt
+    total["completion_tokens"] = total.get("completion_tokens", 0) + step_completion
+    total["total_tokens"] = total.get("total_tokens", 0) + step_total
+    return total
 
 
 def _build_tool_descriptions() -> str:
@@ -131,40 +209,35 @@ async def reasoning_node(state: State, config: RunnableConfig) -> Command:
 
         # Call LLM
         response = await llm.ainvoke(messages)
+        token_usage = _accumulate_usage(state.get("token_usage"), response, llm)
 
-        # Extract this iteration's token usage and accumulate it onto the
-        # running total: react is a loop (reason -> action -> reason -> ...) and
-        # the metric sums per-iteration usage across the whole trajectory.
-        token_usage = dict(state.get("token_usage") or {})
-        if hasattr(response, 'usage_metadata') and response.usage_metadata:
-            usage = response.usage_metadata
-            step_prompt = usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0
-            step_completion = usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0
-            step_total = usage.get("total_tokens", step_prompt + step_completion) or (step_prompt + step_completion)
-            token_usage = {
-                "prompt_tokens": token_usage.get("prompt_tokens", 0) + step_prompt,
-                "completion_tokens": token_usage.get("completion_tokens", 0) + step_completion,
-                "total_tokens": token_usage.get("total_tokens", 0) + step_total,
-            }
-            log_event(
-                event_type="llm_call",
-                payload={
-                    "model": getattr(llm, 'model_name', str(llm)),
-                    "role": "react_reasoning",
-                    "prompt_tokens": step_prompt,
-                    "completion_tokens": step_completion,
-                    "total_tokens": step_total,
-                }
-            )
-
-        # Parse response
         parsed = _parse_react_response(response.content)
+        if parsed is None:
+            # One repair round: show the model its own reply, restate the schema.
+            repair_messages = list(messages)
+            if response.content:
+                repair_messages.append(AIMessage(content=response.content))
+            repair_messages.append(HumanMessage(content=_REPAIR_PROMPT))
+            response = await llm.ainvoke(repair_messages)
+            token_usage = _accumulate_usage(token_usage, response, llm)
+            parsed = _parse_react_response(response.content)
+
+        if parsed is None:
+            logger.warning("[REACT] Response unreadable after repair, finishing case")
+            parsed = {
+                "thought": "Unable to parse response, ending with available information.",
+                "action": "finish",
+                "final_answer": response.content or "",
+            }
 
         thought = parsed.get("thought", "")
         action = parsed.get("action", "finish")
         tool_name = parsed.get("tool_name", "")
         tool_args = parsed.get("tool_args", {})
         final_answer = parsed.get("final_answer", "")
+        intent = parsed.get("intent", "")
+        route_index = parsed.get("route_index", "")
+        route_info = parsed.get("route_info", "")
 
         logger.info(f"[REACT] Thought: {thought[:100]}...")
         logger.info(f"[REACT] Action: {action}")
@@ -178,11 +251,14 @@ async def reasoning_node(state: State, config: RunnableConfig) -> Command:
             "action": action,
             "tool_name": tool_name,
             "tool_args": tool_args,
+            "result": None,
         })
 
-        # Add AI message to history
+        # Replay the model's own reply verbatim: re-rendering it as
+        # "Thought: .../Action: ..." teaches the model to drop the JSON format.
         new_messages = list(state.get("messages", []))
-        new_messages.append(AIMessage(content=f"Thought: {thought}\nAction: {action}"))
+        if response.content:
+            new_messages.append(AIMessage(content=response.content))
 
         update_dict = {
             "messages": new_messages,
@@ -192,8 +268,21 @@ async def reasoning_node(state: State, config: RunnableConfig) -> Command:
             "react_current_action": action,
             "react_current_tool_name": tool_name,
             "react_current_tool_args": tool_args,
+            "react_current_action_index": len(actions) - 1,
             "token_usage": token_usage,
         }
+
+        # Keep the last intent the model declared; it is what the instruction
+        # metric (ID) scores, so an empty later turn must not erase it.
+        if isinstance(intent, str) and intent.strip():
+            update_dict["react_intent"] = intent.strip()
+
+        # route_index / route_info are what the answer metric reads for route
+        # tasks; carry the latest declared values through to the final state.
+        if isinstance(route_index, (str, int)) and str(route_index).strip() != "":
+            update_dict["react_route_index"] = str(route_index).strip()
+        if isinstance(route_info, str) and route_info.strip():
+            update_dict["react_route_info"] = route_info.strip()
 
         if action == "finish":
             update_dict["react_finish"] = True
@@ -263,14 +352,20 @@ async def action_node(state: State, config: RunnableConfig) -> Command:
                 observation = str(result)
                 logger.info(f"[REACT] Tool result: {observation[:200]}...")
 
-            # Add observation to messages
+            # Add observation to messages, and attach the result to the action
+            # entry so the tool trajectory can be exported after the run.
             new_messages = list(state.get("messages", []))
             new_messages.append(HumanMessage(content=f"Observation: {observation}"))
+
+            actions = list(state.get("react_actions", []))
+            idx = state.get("react_current_action_index", -1)
+            if 0 <= idx < len(actions):
+                actions[idx] = {**actions[idx], "result": observation[:4000]}
 
             recorder.tool_call("tool_executed", {"tool_name": tool_name})
 
             return Command(
-                update={"messages": new_messages},
+                update={"messages": new_messages, "react_actions": actions},
                 goto="reasoning"
             )
 
