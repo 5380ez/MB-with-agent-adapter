@@ -1,6 +1,6 @@
 # MobilityBench 已测配置总览（模型 × Harness）
 
-> 记录时间：2026-11-10 · 机器：2×NVIDIA H20（97,871 MiB/卡，48 vCPU，256 GB RAM）· 仓库 HEAD `1effd9b`
+> 记录时间：2026-11-10 · 机器：2×NVIDIA H20（97,871 MiB/卡，48 vCPU，256 GB RAM）· 仓库 HEAD `434905a`（react/plan_and_execute 修复提交）
 > 本文档汇总**实际测过的全部配置**：3 个模型 + 7 个 harness 的版本与参数，以及每个组合的 run id。
 > 版本号与参数均取自本机二进制/配置/日志，不是回忆值。补充材料用的 21 配置勾选表见 `docs/experiment_config.md`。
 
@@ -58,8 +58,8 @@ TILELANG_DEFAULT_TARGET=cuda /opt/vllm-env/bin/vllm serve /opt/models/DeepSeek-V
 
 | harness | 版本（本机实测） | 入口 / 二进制 | 协议 | 单 case 超时 | 上下文 | 输出上限 | MCP |
 |---|---|---|---|---|---|---|---|
-| `react` | 内置（工作区，>`1effd9b`，未提交） | `mbench run -f react` | chat | 600 s（模型条目） | 32,768 | 8192 | 进程内 ToolRegistry |
-| `plan_and_execute` | 内置（HEAD `1effd9b`） | `mbench run -f plan_and_execute` | chat | 600 s（模型条目） | 32,768 | 8192 | 进程内 ToolRegistry |
+| `react` | 内置（`434905a`） | `mbench run -f react` | chat | 600 s（模型条目） | 32,768 | 8192 | 进程内 ToolRegistry |
+| `plan_and_execute` | 内置（`434905a`） | `mbench run -f plan_and_execute` | chat | 600 s（模型条目） | 32,768 | 8192 | 进程内 ToolRegistry |
 | `codex` | **codex-cli 0.155.1** | `codex`（在 PATH，解析到 `plugin-packages/codex/latest/tools/codex_wrapper.sh`） | `openai` / **responses** | 900 s | 32,768 | 默认 | 是 |
 | `claude_code` | **2.1.293** (Claude Code) | `/mnt/workspace/.local/share/agent-harnesses/bin/claude`（**不在 PATH**，需 `CLAUDE_BIN`） | **anthropic** | 900 s | 32,768 | 4096 | 是 |
 | `openclaw` | **OpenClaw 2026.7.1 (2d2ddc4)** | `/opt/openclaw/bin/openclaw`（`OPENCLAW_BIN` 可覆盖） | chat | 900 s | 32,768 | 4096 | 是 |
@@ -68,7 +68,7 @@ TILELANG_DEFAULT_TARGET=cuda /opt/vllm-env/bin/vllm serve /opt/models/DeepSeek-V
 
 ### 每个 harness 的特殊前提（复现时最容易漏）
 
-- **react**：`agent.react.max_iterations = 10`；finish 输出四字段 JSON（`intent` / `route_index` / `content` / `route_info`），`plan_result` 末尾带 ```json 块供 answer 指标读取；改动未提交，提交后需回填 commit hash。
+- **react**：`agent.react.max_iterations = 10`；finish 输出四字段 JSON（`intent` / `route_index` / `content` / `route_info`），`plan_result` 末尾带 ```json 块供 answer 指标读取；对应提交 `434905a`。
 - **plan_and_execute**：自带 planner/worker/reporter prompt；planner 的 `intent` 为**自由文本**（无 8 标签枚举），`RawPlan.steps` 需两层结构（已加裸字符串归一化）。
 - **codex**：`wire_api: responses`（走 `/v1/responses`）；工具名带 `mcp__sandbox__` 前缀时由 `strip_mcp_prefix` 归一化。
 - **claude_code**：`ANTHROPIC_BASE_URL` 不能带 `/v1`；用 `--tools ""` 关掉内置 33 个工具，否则每次请求多 1.7 万 token。
@@ -143,7 +143,7 @@ TILELANG_DEFAULT_TARGET=cuda /opt/vllm-env/bin/vllm serve /opt/models/DeepSeek-V
 ## 5. 口径注意事项（进对比表前必须一并说明）
 
 1. **并行度不统一**：p&e 的 4b/27b 是 `-p 64`，dsh 是 `-p 8`，react·0731 有一轮 `-p 16`，其余 `-p 48`。时长不可直接横比。
-2. **react 代码未提交**：`graph/state.py`、`react/nodes.py`、`react/builder.py`、`prompts/react/*.md` 共 +269/−60 在工作区；发布前必须提交并回填 commit hash。
+2. **react 代码版本**：`graph/state.py`、`react/nodes.py`、`react/builder.py`、`prompts/react/*.md` 共 +269/−60，已提交为 `434905a`；引用这批结果时用该 commit。
 3. **dsh 的工具维度含内置工具**：24,300 次调用里 1,973 次（8.1%）是 `bash` / `todo_write` / `read` / `create_goal` 等 dsh 自带工具，TS_P/TS_R/SC 与其他 harness 不完全可比。
 4. **ID 的 Basic Information Retrieval 分族恒为 0.15 左右**：`POI Search` / `Nearby Search` 未映射进指标表，是该族的固定损失，不是模型能力差异。
 5. **p&e·0731 的 ID 是散文标签惩罚**：planner 输出描述句（中位 32 字符），逐字包含判据命中率低；同模型 codex 为 .7312、dsh 为 .7268。
